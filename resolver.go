@@ -1,5 +1,4 @@
-// Package nacosgrpc provides gRPC naming resolver implementation based on Nacos
-package nacosgrpc
+package grpcnacos
 
 import (
 	"cmp"
@@ -7,9 +6,9 @@ import (
 	"net"
 	"slices"
 	"strconv"
+	"sync"
 	"time"
 
-	"github.com/nacos-group/nacos-sdk-go/v2/clients"
 	"github.com/nacos-group/nacos-sdk-go/v2/clients/naming_client"
 	"github.com/nacos-group/nacos-sdk-go/v2/model"
 	"github.com/nacos-group/nacos-sdk-go/v2/vo"
@@ -20,8 +19,8 @@ import (
 // scheme defines the protocol scheme name for this resolver
 const scheme = "nacos"
 
-// defaultPollInterval is the default interval for polling service instances
-const defaultPollInterval = 5 * time.Second
+// defaultPollInterval is the fallback refresh interval, a variable so tests can shorten it.
+var defaultPollInterval = 5 * time.Second
 
 // init automatically registers the resolver builder when the package is imported
 func init() {
@@ -42,13 +41,13 @@ type Builder struct{}
 //   - error: error information
 func (b *Builder) Build(tgt grpcresolver.Target, cc grpcresolver.ClientConn, opts grpcresolver.BuildOptions) (grpcresolver.Resolver, error) {
 	// Parse DSN configuration
-	parsed, err := DefaultDsnParser(context.Background(), "resolver", tgt.URL.String())
+	parsed, err := DefaultDsnParser(context.Background(), kindResolver, tgt.URL.String())
 	if err != nil {
 		return nil, err
 	}
 
 	// Create Nacos naming client
-	client, err := clients.NewNamingClient(parsed.ClientParam)
+	client, err := newNamingClient(parsed.ClientParam)
 	if err != nil {
 		return nil, err
 	}
@@ -63,6 +62,8 @@ func (b *Builder) Build(tgt grpcresolver.Target, cc grpcresolver.ClientConn, opt
 
 	// Start the resolver
 	if err := r.start(); err != nil {
+		// Do not leak the client when the resolver never gets off the ground.
+		client.CloseClient()
 		return nil, err
 	}
 
@@ -82,9 +83,10 @@ type resolver struct {
 	param        vo.SubscribeParam           // Subscription parameters
 	stopCh       chan struct{}               // Channel to stop polling goroutine
 	resetCh      chan struct{}               // Channel to reset polling timer when subscription pushes
+	closeOnce    sync.Once                   // Guard so Close can be called more than once
 }
 
-// start starts the resolver, performs initial service discovery, 
+// start starts the resolver, performs initial service discovery,
 // and starts both subscription and polling mechanisms
 func (r *resolver) start() error {
 	// Initialize channels
@@ -111,6 +113,8 @@ func (r *resolver) start() error {
 
 	// Query initial service instance list
 	if err := r.refreshInstances(); err != nil {
+		// The subscription is live, take it back before giving up.
+		_ = r.namingClient.Unsubscribe(&r.param)
 		return err
 	}
 
@@ -205,17 +209,24 @@ func (r *resolver) updateState(instances []model.Instance) {
 	// This allows gRPC to handle the empty list appropriately (e.g., entering TRANSIENT_FAILURE).
 	// When service instances become available later, the subscription callback will trigger
 	// updateState again with non-empty addresses, and the connection will recover.
-	r.cc.UpdateState(grpcresolver.State{Addresses: addrs})
+	//
+	// A rejected update is not fatal: the polling fallback re-resolves on its own
+	// schedule, so the error is dropped on purpose.
+	_ = r.cc.UpdateState(grpcresolver.State{Addresses: addrs})
 }
 
 // ResolveNow resolves the target address immediately (currently implemented as no-op)
 func (r *resolver) ResolveNow(grpcresolver.ResolveNowOptions) {}
 
-// Close closes the resolver, stops polling, unsubscribes and closes the client
+// Close closes the resolver, stops polling, unsubscribes and closes the client.
+// It is safe to call more than once.
 func (r *resolver) Close() {
-	// Stop the polling goroutine
-	close(r.stopCh)
-	// Unsubscribe from service changes
-	_ = r.namingClient.Unsubscribe(&r.param)
-	r.namingClient.CloseClient()
+	r.closeOnce.Do(func() {
+		// Stop the polling goroutine, if it was ever started.
+		if r.stopCh != nil {
+			close(r.stopCh)
+		}
+		_ = r.namingClient.Unsubscribe(&r.param)
+		r.namingClient.CloseClient()
+	})
 }
